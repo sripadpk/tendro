@@ -1,5 +1,6 @@
+
 import "dotenv/config";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { Pool } from "pg";
 
 const connectionString = process.env.DATABASE_URL;
@@ -18,8 +19,6 @@ async function main() {
   const client = await pool.connect();
 
   try {
-    await client.query("BEGIN");
-
     await client.query(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
         filename TEXT PRIMARY KEY,
@@ -27,36 +26,63 @@ async function main() {
       )
     `);
 
-    const filename = "001_initial_schema.sql";
+    const migrationDirectory = new URL("./migrations/", import.meta.url);
 
-    const existing = await client.query(
-      "SELECT filename FROM schema_migrations WHERE filename = $1",
-      [filename]
-    );
+    const files = (await readdir(migrationDirectory))
+      .filter((filename) => /^\d+.*\.sql$/.test(filename))
+      .sort((a, b) => a.localeCompare(b, undefined, {
+        numeric: true,
+      }));
 
-    if (existing.rowCount && existing.rowCount > 0) {
-      await client.query("COMMIT");
-      console.log(`Migration ${filename} already applied.`);
+    if (files.length === 0) {
+      console.log("No migration files found.");
       return;
     }
 
-    const sql = await readFile(
-      new URL("./migrations/001_initial_schema.sql", import.meta.url),
-      "utf8"
-    );
+    for (const filename of files) {
+      let inTransaction = false;
 
-    await client.query(sql);
+      try {
+        await client.query("BEGIN");
+        inTransaction = true;
 
-    await client.query(
-      "INSERT INTO schema_migrations (filename) VALUES ($1)",
-      [filename]
-    );
+        const existing = await client.query(
+          "SELECT filename FROM schema_migrations WHERE filename = $1",
+          [filename],
+        );
 
-    await client.query("COMMIT");
-    console.log(`Migration ${filename} applied successfully.`);
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
+        if (existing.rowCount && existing.rowCount > 0) {
+          await client.query("COMMIT");
+          inTransaction = false;
+          console.log(`Migration ${filename} already applied.`);
+          continue;
+        }
+
+        const sql = await readFile(
+          new URL(filename, migrationDirectory),
+          "utf8",
+        );
+
+        await client.query(sql);
+
+        await client.query(
+          "INSERT INTO schema_migrations (filename) VALUES ($1)",
+          [filename],
+        );
+
+        await client.query("COMMIT");
+        inTransaction = false;
+        console.log(`Migration ${filename} applied successfully.`);
+      } catch (error) {
+        if (inTransaction) {
+          await client.query("ROLLBACK");
+        }
+
+        throw new Error(`Failed to apply ${filename}`, {
+          cause: error,
+        });
+      }
+    }
   } finally {
     client.release();
   }
@@ -65,6 +91,9 @@ async function main() {
 main()
   .catch((error) => {
     console.error("Migration failed:", error);
+    if (error instanceof Error && error.cause) {
+      console.error("Cause:", error.cause);
+    }
     process.exitCode = 1;
   })
   .finally(async () => {
