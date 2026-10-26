@@ -104,6 +104,18 @@ router.post("/", async (req, res) => {
       );
     }
 
+    await client.query(
+      `INSERT INTO request_status_history
+        (organization_id, request_id, from_status, to_status, comment)
+      VALUES ($1, $2, NULL, $3, $4)`,
+      [
+        DEMO_ORGANIZATION_ID,
+        request.id,
+        "draft",
+        "Request created",
+      ]
+    );
+
     await client.query("COMMIT");
 
     res.status(201).json({

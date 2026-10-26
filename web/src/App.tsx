@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
 import {
-  ArrowDownRight,
   ArrowUpRight,
   Bell,
   ChevronDown,
@@ -17,7 +16,6 @@ import {
   Truck,
   Wallet,
   ArrowLeft,
-  CalendarDays,
 } from "lucide-react";
 import "./App.css";
 import { supabase } from "./supabase";
@@ -675,7 +673,7 @@ useEffect(() => {
                     </tr>
                   </thead>
                   <tbody>
-                    {request.items.map((item, index) => (
+                    {request.items.map((item) => (
                       <tr key={item.id}>
                         <td>
                           <div className="request-cell">
