@@ -16,8 +16,14 @@ import {
   Sparkles,
   Truck,
   Wallet,
+  ArrowLeft,
+  CalendarDays,
 } from "lucide-react";
 import "./App.css";
+import { supabase } from "./supabase";
+import Auth from "./Auth";
+import { LogOut } from "lucide-react";
+import { apiFetch } from "./api";
 
 type RequestItem = {
   id: string;
@@ -42,6 +48,22 @@ type ApiResponse = {
   data: ProcurementRequest[];
 };
 
+
+type RequestHistoryEvent = {
+  id: string;
+  from_status: string | null;
+  to_status: string;
+  comment: string | null;
+  changed_by: string | null;
+  changed_at: string;
+};
+
+type HistoryApiResponse = {
+  success: boolean;
+  data: RequestHistoryEvent[];
+};
+
+
 const navigation = [
   { label: "Overview", icon: LayoutDashboard },
   { label: "Requests", icon: FileText, active: true },
@@ -49,11 +71,57 @@ const navigation = [
   { label: "Purchase orders", icon: ShoppingCart },
 ];
 
+function formatStatus(status: string) {
+  return status
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
 function App() {
+  const [authLoading, setAuthLoading] = useState(true);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  useEffect(() => {
+    let mounted = true;
+
+    supabase.auth.getSession().then(({ data, error }) => {
+      if (!mounted) return;
+
+      if (error) {
+        console.error("Could not restore Supabase session:", error);
+      }
+
+      setIsAuthenticated(Boolean(data.session));
+      setAuthLoading(false);
+    });
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      setIsAuthenticated(Boolean(session));
+      setAuthLoading(false);
+    });
+
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
+  }, []);
   const [requests, setRequests] = useState<ProcurementRequest[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
+  const [selectedRequestId, setSelectedRequestId] = useState<string | null>(null);
+  
+  useEffect(() => {
+    if (!selectedRequestId) {
+      setHistory([]);
+      setHistoryError("");
+      return;
+    }
+
+    void loadRequestHistory(selectedRequestId);
+  }, [selectedRequestId]);
+
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [newTitle, setNewTitle] = useState("");
   const [newDescription, setNewDescription] = useState("");
@@ -62,13 +130,20 @@ function App() {
   ]);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState("");
+  const [workflowBusy, setWorkflowBusy] = useState(false);
+  const [workflowMessage, setWorkflowMessage] = useState("");
+  const [history, setHistory] = useState<RequestHistoryEvent[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+  const [showRejectForm, setShowRejectForm] = useState(false);
+  const [rejectionReason, setRejectionReason] = useState("");
 
   useEffect(() => {
     const controller = new AbortController();
 
     async function loadRequests() {
       try {
-        const response = await fetch("http://localhost:3000/api/requests", {
+        const response = await apiFetch("/api/requests", {
           signal: controller.signal,
         });
 
@@ -159,7 +234,7 @@ async function createRequest(event: React.FormEvent<HTMLFormElement>) {
   setSaving(true);
 
   try {
-    const response = await fetch("http://localhost:3000/api/requests", {
+    const response = await apiFetch("/api/requests", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -180,7 +255,7 @@ async function createRequest(event: React.FormEvent<HTMLFormElement>) {
     setNewDescription("");
     setNewItems([{ name: "", quantity: "1", unit: "pieces" }]);
 
-    const refreshed = await fetch("http://localhost:3000/api/requests");
+    const refreshed = await apiFetch("/api/requests");
     const data: ApiResponse = await refreshed.json();
 
     if (!refreshed.ok || !data.success) {
@@ -197,7 +272,496 @@ async function createRequest(event: React.FormEvent<HTMLFormElement>) {
   }
 }
 
-  return (
+async function submitRequest(requestId: string) {
+  setWorkflowBusy(true);
+  setWorkflowMessage("");
+
+  try {
+    const response = await apiFetch(
+      `/api/requests/${requestId}/submit`,
+      {
+        method: "POST",
+      }
+    );
+
+    const result = await response.json();
+
+    if (!response.ok || !result.success) {
+      throw new Error(result.message || "Failed to submit request.");
+    }
+
+    const refreshResponse = await apiFetch(
+      "/api/requests"
+    );
+    const refreshedData = await refreshResponse.json();
+
+    if (!refreshResponse.ok || !refreshedData.success) {
+      throw new Error("Request submitted, but refreshing the list failed.");
+    }
+
+    setRequests(refreshedData.data);
+    setWorkflowMessage("Request submitted for approval successfully.");
+  } catch (err) {
+    setWorkflowMessage(
+      err instanceof Error ? err.message : "Something went wrong."
+    );
+  } finally {
+    setWorkflowBusy(false);
+  }
+}
+
+async function decideRequest(
+  requestId: string,
+  decision: "approve" | "reject"
+) {
+  setWorkflowBusy(true);
+  setWorkflowMessage("");
+
+  try {
+    const response = await apiFetch(
+      `/api/requests/${requestId}/decision`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          decision,
+          comment: decision === "reject" ? rejectionReason.trim() : undefined,
+        }),
+      }
+    );
+
+    const result = await response.json();
+
+    if (!response.ok || !result.success) {
+      throw new Error(result.message || "Failed to update request.");
+    }
+
+    const refreshResponse = await apiFetch(
+      "/api/requests"
+    );
+    const refreshedData = await refreshResponse.json();
+
+    if (!refreshResponse.ok || !refreshedData.success) {
+      throw new Error("Decision saved, but refreshing the list failed.");
+    }
+
+    setRequests(refreshedData.data);
+
+    await loadRequestHistory(requestId);
+
+    setShowRejectForm(false);
+    setRejectionReason("");
+
+    setWorkflowMessage(
+      decision === "approve"
+        ? "Request approved successfully."
+        : "Request rejected successfully."
+    );
+  } catch (err) {
+    setWorkflowMessage(
+      err instanceof Error ? err.message : "Something went wrong."
+    );
+  } finally {
+    setWorkflowBusy(false);
+  }
+}
+
+async function handleLogout() {
+  const { error } = await supabase.auth.signOut();
+
+  if (error) {
+    console.error("Logout failed:", error.message);
+    return;
+  }
+
+  setIsAuthenticated(false);
+}
+
+
+async function loadRequestHistory(requestId: string) {
+  setHistoryLoading(true);
+  setHistoryError("");
+
+  try {
+    const response = await apiFetch(
+      `/api/requests/${requestId}/history`
+    );
+
+    const result: HistoryApiResponse = await response.json();
+
+    if (!response.ok || !result.success || !Array.isArray(result.data)) {
+      throw new Error("Could not load request history.");
+    }
+
+    setHistory(result.data);
+  } catch (err) {
+    setHistoryError(
+      err instanceof Error ? err.message : "Something went wrong."
+    );
+  } finally {
+    setHistoryLoading(false);
+  }
+}
+
+useEffect(() => {
+    if (!selectedRequestId) {
+      setHistory([]);
+      setHistoryError("");
+      return;
+    }
+
+    void loadRequestHistory(selectedRequestId);
+  }, [selectedRequestId]);
+
+  if (authLoading) {
+    return <main className="auth-page">Loading Tendro...</main>;
+  }
+
+  if (!isAuthenticated) {
+    return <Auth onAuthenticated={() => setIsAuthenticated(true)} />;
+  }
+
+  if (selectedRequestId) {
+  const request = requests.find(
+    (item) => item.id === selectedRequestId,
+  );
+
+  if (request) {
+    return (
+      <div className="app-shell">
+        <aside className="sidebar">
+          <a className="brand" href="#" aria-label="Tendro home">
+            <span className="brand-mark">t.</span>
+            <span>tendro</span>
+          </a>
+
+          <div className="workspace">
+            <div className="workspace-avatar">A</div>
+            <div className="workspace-copy">
+              <strong>Acme Manufacturing</strong>
+              <span>Free workspace</span>
+            </div>
+          </div>
+
+          <div className="nav-label">WORKSPACE</div>
+          <nav className="navigation">
+            {navigation.map(({ label, icon: Icon }) => (
+              <button
+                key={label}
+                type="button"
+                className={`nav-item ${label === "Requests" ? "active" : ""}`}
+                onClick={() => setSelectedRequestId(null)}
+              >
+                <Icon size={18} strokeWidth={1.8} />
+                <span>{label}</span>
+                {label === "Requests" && (
+                  <span className="nav-count">{requests.length}</span>
+                )}
+              </button>
+            ))}
+          </nav>
+
+          <div className="sidebar-bottom">
+            <div className="profile">
+              <div className="profile-avatar">SP</div>
+              <div className="profile-copy">
+                <strong>Workspace admin</strong>
+                <span>Demo account</span>
+              </div>
+            </div>
+          </div>
+        </aside>
+
+        <main className="main-content">
+          <header className="topbar">
+            <div className="breadcrumbs">
+              Workspace <span>/</span>
+              <button
+                type="button"
+                className="breadcrumb-button"
+                onClick={() => setSelectedRequestId(null)}
+              >
+                Requests
+              </button>
+              <span>/</span> <strong>Request details</strong>
+            </div>
+            <div className="topbar-actions">
+              <span className="environment">
+                <span /> Demo environment
+              </span>
+              <div className="topbar-avatar">SP</div>
+            </div>
+          </header>
+
+          <div className="page-content">
+            <button
+              type="button"
+              className="back-button"
+              onClick={() => setSelectedRequestId(null)}
+            >
+              <ArrowLeft size={16} /> Back to requests
+            </button>
+
+            <section className="detail-heading">
+              <div>
+                <div className="eyebrow">
+                  <span className="eyebrow-dot" /> PROCUREMENT REQUEST
+                </div>
+                <h1>{request.title}<span>.</span></h1>
+                <p className="page-subtitle">
+                  REQ-{String(request.request_number).padStart(4, "0")}
+                  {" · "}
+                  Created{" "}
+                  {new Date(request.created_at).toLocaleDateString("en-IN", {
+                    day: "2-digit",
+                    month: "short",
+                    year: "numeric",
+                  })}
+                </p>
+              </div>
+
+              <span className={`status-badge status-${request.status}`}>
+                <span />
+                {formatStatus(request.status)}
+              </span>
+            </section>
+
+            <div className="detail-grid">
+              <section className="detail-card">
+                <h2>Request information</h2>
+
+                <div className="detail-field">
+                  <span>Request number</span>
+                  <strong>
+                    REQ-{String(request.request_number).padStart(4, "0")}
+                  </strong>
+                </div>
+
+                <div className="detail-field">
+                  <span>Organization</span>
+                  <strong>{request.organization_name}</strong>
+                </div>
+
+                <div className="detail-field">
+                  <span>Description</span>
+                  <p>
+                    {request.description?.trim() ||
+                      "No description provided."}
+                  </p>
+                </div>
+              </section>
+              <section className="detail-card">
+                <h2>Request status</h2>
+
+                <span className={`status-badge status-${request.status}`}>
+                  <span />
+                  {formatStatus(request.status)}
+                </span>
+
+                <p className="detail-muted">
+                  This is the current status recorded by Tendro.
+                </p>
+
+                {request.status === "review_required" && (
+                  <div className="workflow-actions">
+                    <button
+                      type="button"
+                      className="primary-button"
+                      disabled={workflowBusy}
+                      onClick={() => void decideRequest(request.id, "approve")}
+                    >
+                      {workflowBusy ? "Processing..." : "Approve"}
+                    </button>
+
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      disabled={workflowBusy}
+                      onClick={() => {
+                        setShowRejectForm(true);
+                        setRejectionReason("");
+                        setWorkflowMessage("");
+                      }}
+                    >
+                      Reject
+                    </button>
+                  </div>
+                )}
+
+                {showRejectForm && request.status === "review_required" && (
+                  <div className="rejection-form workflow-review-actions">
+                    <label
+                      htmlFor="rejection-reason"
+                      className="form-field workflow-comment-field"
+                    >
+                      Reason for rejection
+                    </label>
+
+                    <textarea
+                      id="rejection-reason"
+                      value={rejectionReason}
+                      onChange={(event) =>
+                        setRejectionReason(event.target.value)
+                      }
+                      placeholder="Explain why this request is being rejected..."
+                      rows={3}
+                    />
+
+                    <div className="workflow-actions">
+                      <button
+                        type="button"
+                        className="primary-button"
+                        disabled={workflowBusy || !rejectionReason.trim()}
+                        onClick={() => void decideRequest(request.id, "reject")}
+                      >
+                        {workflowBusy ? "Rejecting..." : "Confirm rejection"}
+                      </button>
+
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        disabled={workflowBusy}
+                        onClick={() => {
+                          setShowRejectForm(false);
+                          setRejectionReason("");
+                        }}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {request.status === "draft" && (
+                  <button
+                    type="button"
+                    className="primary-button"
+                    disabled={workflowBusy}
+                    onClick={() => void submitRequest(request.id)}
+                  >
+                    {workflowBusy ? "Submitting..." : "Submit for approval"}
+                  </button>
+                )}
+
+                {workflowMessage && (
+                  <p role="status" className="detail-muted">
+                    {workflowMessage}
+                  </p>
+                )}
+              </section>
+            </div>
+
+            <section className="detail-card detail-items-card">
+              <div className="detail-card-heading">
+                <div>
+                  <h2>Line items</h2>
+                  <p>Products and materials included in this request.</p>
+                </div>
+                <span className="items-count">
+                  {request.items.length}{" "}
+                  {request.items.length === 1 ? "item" : "items"}
+                </span>
+              </div>
+
+              <div className="table-scroll">
+                <table className="requests-table detail-items-table">
+                  <thead>
+                    <tr>
+                      <th>ITEM</th>
+                      <th>QUANTITY</th>
+                      <th>UNIT</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {request.items.map((item, index) => (
+                      <tr key={item.id}>
+                        <td>
+                          <div className="request-cell">
+                            <div className="request-file-icon">
+                              <Package size={17} />
+                            </div>
+                            <strong>{item.name}</strong>
+                          </div>
+                        </td>
+                        <td>{item.quantity.toLocaleString("en-IN")}</td>
+                        <td>{item.unit}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+
+            <section className="detail-card history-card">
+              <div className="detail-card-heading">
+                <div>
+                  <h2>Activity history</h2>
+                  <p>A timeline of status changes recorded by Tendro.</p>
+                </div>
+                <span className="items-count">
+                  {history.length} events
+                </span>
+              </div>
+
+              {historyLoading ? (
+                <p className="history-message">Loading activity history...</p>
+              ) : historyError ? (
+                <p className="history-message error-message" role="alert">
+                  {historyError}
+                </p>
+              ) : history.length === 0 ? (
+                <p className="history-message">
+                  No activity has been recorded yet.
+                </p>
+              ) : (
+                <ol className="history-timeline">
+                  {history.map((event) => (
+                    <li key={event.id} className="history-event">
+                      <span className="history-event-dot" />
+                      <div className="history-event-content">
+                        <strong>
+                          {event.from_status
+                            ? `${formatStatus(event.from_status)} → ${formatStatus(event.to_status)}`
+                            : `Request created · ${formatStatus(event.to_status)}`}
+                        </strong>
+
+                        <time dateTime={event.changed_at}>
+                          {new Date(event.changed_at).toLocaleString("en-IN", {
+                            day: "2-digit",
+                            month: "short",
+                            year: "numeric",
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          })}
+                        </time>
+
+                        {event.comment &&
+                          event.comment !== "Request created" && (
+                            <p className="history-comment">
+                              {event.comment}
+                            </p>
+                          )}
+                      </div>
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </section>
+
+            <footer className="page-footer">
+              <span>© 2026 Tendro</span>
+              <span>Built for better business decisions.</span>
+            </footer>
+          </div>
+        </main>
+      </div>
+    );
+  }
+}
+
+return (
     <div className="app-shell">
       <aside className="sidebar">
         <a className="brand" href="#" aria-label="Tendro home">
@@ -263,7 +827,6 @@ async function createRequest(event: React.FormEvent<HTMLFormElement>) {
               <strong>Workspace admin</strong>
               <span>Demo account</span>
             </div>
-            <ChevronDown size={16} />
           </div>
         </div>
       </aside>
@@ -280,6 +843,15 @@ async function createRequest(event: React.FormEvent<HTMLFormElement>) {
               <i />
             </button>
             <div className="topbar-avatar">SP</div>
+            <button
+              type="button"
+              className="logout-button topbar-logout"
+              onClick={() => void handleLogout()}
+              title="Sign out"
+              aria-label="Sign out"
+            >
+              <LogOut size={16} />
+            </button>
           </div>
         </header>
 
@@ -461,7 +1033,13 @@ async function createRequest(event: React.FormEvent<HTMLFormElement>) {
                           <div className="request-cell">
                             <div className="request-file-icon"><FileText size={17} /></div>
                             <div>
-                              <strong>{request.title}</strong>
+                              <button
+                                type="button"
+                                className="request-title-button"
+                                onClick={() => setSelectedRequestId(request.id)}
+                              >
+                                {request.title}
+                              </button>
                               <span>REQ-{String(request.request_number).padStart(4, "0")}</span>
                             </div>
                           </div>
